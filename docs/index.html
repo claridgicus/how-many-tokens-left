@@ -47,7 +47,7 @@
   .bar .spacer { flex: 1; }
   .bar .dimc { color: var(--dim); font-weight: 400; }
   .bar .module {
-    color: var(--fg); padding: 2px 8px; border-bottom: 1px solid transparent;
+    color: var(--fg); padding: 4px 10px; border-bottom: 1px solid transparent;
     cursor: pointer; user-select: none;
   }
   .bar .module:hover, .bar .module.open { border-bottom-color: var(--fg); }
@@ -98,7 +98,7 @@
   pre .c { color: var(--dim); }
   pre .s { color: var(--warn); }
   code { font-family: var(--mono); }
-  p code, li code { background: var(--panel); border: 1px solid var(--line); padding: 1px 5px; font-size: 13px; }
+  p code, li code { background: var(--panel); border: 1px solid var(--line); padding: 2px 7px; font-size: 13px; }
   .two { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
   .two > *, .grid3 > *, header.hero > * { min-width: 0; }
   @media (max-width: 860px) { .two { grid-template-columns: 1fr; } }
@@ -106,7 +106,7 @@
   ul.plain { margin: 0; padding-left: 0; list-style: none; }
   ul.plain li { padding-left: 20px; position: relative; margin-bottom: 8px; color: #bdbdbd; }
   ul.plain li::before { content: "▪"; position: absolute; left: 0; color: var(--ok); }
-  kbd { border: 1px solid var(--line); border-bottom-width: 2px; padding: 0 6px; font-family: var(--mono); font-size: 12px; background: var(--panel); }
+  kbd { border: 1px solid var(--line); border-bottom-width: 2px; padding: 2px 8px; font-family: var(--mono); font-size: 12px; background: var(--panel); }
   table { border-collapse: collapse; width: 100%; font-size: 14px; }
   td { border-top: 1px solid var(--line); padding: 10px 12px 10px 0; vertical-align: top; color: #bdbdbd; }
   td:first-child { color: var(--fg); white-space: nowrap; width: 9ch; }
@@ -129,7 +129,6 @@
 <div class="wrap">
   <header class="hero">
     <div>
-      <p class="eyebrow">Waybar module · CLIProxyAPI</p>
       <h1>How many tokens<br>left<span class="q">?</span></h1>
       <p class="lede">
         See the 5-hour and weekly quota left on every Claude and Codex account
