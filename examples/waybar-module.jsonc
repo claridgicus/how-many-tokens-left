@@ -1,0 +1,12 @@
+// Add "custom/tokens" to one of your modules-left/center/right arrays,
+// then paste this block into your Waybar config.
+"custom/tokens": {
+    "exec": "how-many-tokens-left waybar",
+    "return-type": "json",
+    "format": "{}",
+    "tooltip": true,
+    "escape": false,
+    "on-click": "how-many-tokens-left popover",
+    "on-click-right": "how-many-tokens-left refresh",
+    "on-click-middle": "how-many-tokens-left dashboard"
+}

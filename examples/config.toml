@@ -1,0 +1,57 @@
+# ~/.config/how-many-tokens-left/config.toml
+# Every key is optional; these are the defaults.
+
+# CLIProxyAPI server (the one serving /management.html).
+url = "http://127.0.0.1:8317"
+
+# Management key (the plaintext `remote-management.secret-key`).
+# Prefer a file or the HMTL_MANAGEMENT_KEY env var over inlining it here.
+# If neither is set, ~/.config/how-many-tokens-left/management-key and
+# ~/.config/cliproxyapi/management-key.txt are tried.
+# management_key = ""
+# management_key_file = "~/.config/cliproxyapi/management-key.txt"
+
+# Seconds between polls. Upstream usage endpoints rate-limit; keep >= 120.
+interval = 300
+timeout = 20
+
+# Providers to show, in bar order. Supported: claude, codex.
+providers = ["claude", "codex"]
+
+# How accounts are pooled into the bar number for each window:
+#   mean - average % left across accounts (a "pool" of capacity)
+#   min  - the worst account
+#   sum  - total % left, e.g. 165% = 1.65 accounts' worth
+aggregate = "mean"
+
+# Remaining-% thresholds for colours and the warning/critical CSS classes.
+warning = 35
+critical = 15
+
+show_disabled = false
+bar_width = 10   # tooltip meter width in cells
+
+[icons]
+claude = "󰚩"
+codex = "󰧑"
+default = "󱙺"
+
+[colors]
+ok = "#99FFE4"
+warning = "#FFC799"
+critical = "#FF8080"
+dim = "#808080"
+background = "#101010"   # dropdown panel
+foreground = "#d8d8d8"
+
+[popover]
+width = 440
+anchor = "cursor"        # cursor (Hyprland) | left | center | right
+margin = 6
+dither_cell = 2          # dither pixel size in device pixels
+close_on_focus_loss = true
+preload = true          # keep the panel resident so clicks open it instantly
+
+# Short names for the bar/tooltip. Without one, the email's domain is used.
+[aliases]
+# "me@example.com" = "personal"

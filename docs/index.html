@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How Many Tokens Left</title>
+<meta name="description" content="A Waybar module and dropdown that shows the 5-hour and weekly quota left on every Claude and Codex account in CLIProxyAPI.">
+<meta property="og:title" content="How Many Tokens Left">
+<meta property="og:description" content="5-hour and weekly quota for every CLIProxyAPI account, in your Waybar.">
+<meta property="og:image" content="https://claridgicus.github.io/how-many-tokens-left/assets/panel.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0b0b0b;
+    --panel: #121212;
+    --line: #232323;
+    --fg: #d8d8d8;
+    --dim: #7c7c7c;
+    --ok: #99FFE4;
+    --warn: #FFC799;
+    --crit: #FF8080;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.65 var(--mono);
+  }
+  a { color: var(--ok); text-decoration: none; border-bottom: 1px dotted currentColor; }
+  a:hover { color: #fff; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 16px; }
+
+  /* fake waybar */
+  .bar {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; align-items: center; gap: 18px;
+    height: 34px; padding: 0 16px;
+    background: #101010; border-bottom: 1px solid var(--line);
+    font-size: 12px; font-weight: 800; color: #c87830;
+    overflow: hidden; white-space: nowrap;
+  }
+  .bar .spacer { flex: 1; }
+  .bar .dimc { color: var(--dim); font-weight: 400; }
+  .bar .module {
+    color: var(--fg); padding: 2px 8px; border-bottom: 1px solid transparent;
+    cursor: pointer; user-select: none;
+  }
+  .bar .module:hover, .bar .module.open { border-bottom-color: var(--fg); }
+  .bar .b { font-weight: 800; }
+  .bar .ok { color: var(--ok); }
+  .bar .warn { color: var(--warn); }
+  .bar .muted { color: var(--dim); font-weight: 400; }
+  @media (max-width: 640px) { .bar .hide-sm { display: none; } }
+
+  header.hero { padding: 72px 0 40px; display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 48px; align-items: start; }
+  @media (max-width: 860px) { header.hero { grid-template-columns: 1fr; padding-top: 44px; } }
+  .eyebrow { font-size: 11px; letter-spacing: 3px; color: var(--dim); text-transform: uppercase; margin: 0 0 16px; }
+  h1 { font-size: clamp(34px, 6vw, 58px); line-height: 1.02; margin: 0 0 22px; letter-spacing: -1px; font-weight: 800; }
+  h1 .q { color: var(--ok); }
+  .lede { color: #bdbdbd; max-width: 34em; margin: 0 0 28px; }
+  .ctas { display: flex; flex-wrap: wrap; gap: 12px; }
+  .btn {
+    display: inline-block; padding: 10px 16px; border: 1px solid var(--line);
+    color: var(--fg); background: var(--panel); font-weight: 700; font-size: 13px;
+  }
+  .btn.primary { background: var(--ok); color: #0b0b0b; border-color: var(--ok); }
+  .btn:hover { border-color: var(--fg); color: inherit; }
+  .btn.primary:hover { color: #0b0b0b; filter: brightness(1.08); }
+
+  .shot { position: relative; justify-self: center; }
+  .shot img { width: 100%; max-width: 424px; display: block; border-radius: 6px;
+              box-shadow: 0 30px 60px rgba(0,0,0,.6), 0 0 0 1px var(--line); }
+  .shot figcaption { font-size: 11px; color: var(--dim); margin-top: 10px; text-align: center; }
+
+  canvas.dither { display: block; width: 100%; height: 18px; image-rendering: pixelated; margin: 0 0 6px; }
+  .meters { margin: 36px 0 0; max-width: 520px; }
+  .meter-row { display: grid; grid-template-columns: 3ch 1fr 5ch; gap: 12px; align-items: center; font-size: 13px; }
+  .meter-row .pct { text-align: right; font-weight: 800; }
+  .meter-row .win { color: var(--dim); }
+
+  section { padding: 48px 0; border-top: 1px solid var(--line); }
+  h2 { font-size: 11px; letter-spacing: 3px; color: var(--dim); text-transform: uppercase; margin: 0 0 24px; font-weight: 700; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; }
+  @media (max-width: 860px) { .grid3 { grid-template-columns: 1fr; } }
+  .feat h3 { margin: 0 0 6px; font-size: 15px; }
+  .feat p { margin: 0; color: #a9a9a9; font-size: 14px; }
+  .feat .k { color: var(--ok); }
+
+  pre {
+    margin: 0 0 18px; padding: 16px 18px; background: var(--panel); border: 1px solid var(--line);
+    overflow-x: auto; font-size: 13px; line-height: 1.6; color: #cfcfcf;
+  }
+  pre .c { color: var(--dim); }
+  pre .s { color: var(--warn); }
+  code { font-family: var(--mono); }
+  p code, li code { background: var(--panel); border: 1px solid var(--line); padding: 1px 5px; font-size: 13px; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+  .two > *, .grid3 > *, header.hero > * { min-width: 0; }
+  @media (max-width: 860px) { .two { grid-template-columns: 1fr; } }
+  .two h3 { font-size: 14px; margin: 0 0 10px; }
+  ul.plain { margin: 0; padding-left: 0; list-style: none; }
+  ul.plain li { padding-left: 20px; position: relative; margin-bottom: 8px; color: #bdbdbd; }
+  ul.plain li::before { content: "▪"; position: absolute; left: 0; color: var(--ok); }
+  kbd { border: 1px solid var(--line); border-bottom-width: 2px; padding: 0 6px; font-family: var(--mono); font-size: 12px; background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  td { border-top: 1px solid var(--line); padding: 10px 12px 10px 0; vertical-align: top; color: #bdbdbd; }
+  td:first-child { color: var(--fg); white-space: nowrap; width: 9ch; }
+  footer { padding: 36px 0 60px; border-top: 1px solid var(--line); color: var(--dim); font-size: 12px; display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; }
+</style>
+</head>
+<body>
+
+<div class="bar" aria-hidden="true">
+  <span>18:42</span><span class="dimc">|</span><span>1 2 3</span>
+  <span class="spacer"></span>
+  <span class="module" id="barmod" title="click">
+    <span class="muted">claude</span> <span class="muted">5h 68%</span> <span class="b ok">7d 36%</span>
+    <span class="muted">&nbsp;│&nbsp;</span>
+    <span class="muted">codex</span> <span class="b ok">7d 57%</span>
+  </span>
+  <span class="hide-sm">cpu 12%</span><span class="hide-sm">mem 41%</span>
+</div>
+
+<div class="wrap">
+  <header class="hero">
+    <div>
+      <p class="eyebrow">Waybar module · CLIProxyAPI</p>
+      <h1>How many tokens<br>left<span class="q">?</span></h1>
+      <p class="lede">
+        See the 5-hour and weekly quota left on every Claude and Codex account
+        in <a href="https://github.com/router-for-me/CLIProxyAPI">CLIProxyAPI</a>,
+        right in your bar. The window that will stop you first is highlighted.
+        Click for a dropdown with dithered meters for each account.
+      </p>
+      <div class="ctas">
+        <a class="btn primary" href="https://github.com/claridgicus/how-many-tokens-left">View on GitHub</a>
+        <a class="btn" href="#install">Install</a>
+      </div>
+
+      <div class="meters" aria-label="Example dithered meters">
+        <div class="meter-row"><span class="win">5h</span><canvas class="dither" data-pct="68" data-color="#99FFE4" data-dim="1"></canvas><span class="pct" style="color:var(--ok)">68%</span></div>
+        <div class="meter-row"><span class="win">7d</span><canvas class="dither" data-pct="29" data-color="#FFC799"></canvas><span class="pct" style="color:var(--warn)">29%</span></div>
+        <div class="meter-row"><span class="win">7d</span><canvas class="dither" data-pct="9" data-color="#FF8080"></canvas><span class="pct" style="color:var(--crit)">9%</span></div>
+      </div>
+    </div>
+    <figure class="shot">
+      <img src="assets/panel.png" alt="The dropdown panel: pooled Claude and Codex quota, then 5-hour and weekly dithered meters with reset countdowns for each account" width="636" height="814">
+      <figcaption>The dropdown, opened from the bar (demo accounts)</figcaption>
+    </figure>
+  </header>
+
+  <section>
+    <h2>What it does</h2>
+    <div class="grid3">
+      <div class="feat">
+        <h3>One number per provider</h3>
+        <p>The bar shows how much of your account pool is left, for 5h and 7d. The <span class="k">smaller</span> window is coloured; the other is dimmed.</p>
+      </div>
+      <div class="feat">
+        <h3>A dropdown that opens instantly</h3>
+        <p>The panel stays loaded in the background, so a click shows it straight away. It opens under your cursor on the monitor you clicked.</p>
+      </div>
+      <div class="feat">
+        <h3>Polls once for every bar</h3>
+        <p>It checks every 5 minutes. One process does the polling and every monitor's bar reads its cache, so there's only one set of API calls.</p>
+      </div>
+      <div class="feat">
+        <h3>Never sees your tokens</h3>
+        <p>Requests go through CLIProxyAPI's management <code>api-call</code> proxy, so your OAuth tokens stay on the server.</p>
+      </div>
+      <div class="feat">
+        <h3>Falls back when rate-limited</h3>
+        <p>If a usage endpoint returns a 429, it uses the rate-limit headers from CLIProxyAPI's last request and marks the account as cached.</p>
+      </div>
+      <div class="feat">
+        <h3>Python, no dependencies</h3>
+        <p>One file, standard library only. GTK4 and gtk4-layer-shell are only needed for the dropdown, and <code>status</code> works in any terminal.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="install">
+    <h2>Install</h2>
+    <div class="two">
+      <div>
+        <h3>Arch</h3>
+<pre><span class="c"># from a checkout</span>
+git clone https://github.com/claridgicus/how-many-tokens-left
+cd how-many-tokens-left
+makepkg -si</pre>
+        <h3>Anywhere else</h3>
+<pre>make install-user   <span class="c"># symlinks into ~/.local/bin</span></pre>
+        <h3>Check it works</h3>
+<pre>how-many-tokens-left status
+HMTL_DEMO=1 how-many-tokens-left popover   <span class="c"># try the UI with fake data</span></pre>
+      </div>
+      <div>
+        <h3>Waybar</h3>
+<pre><span class="s">"custom/tokens"</span>: {
+    <span class="s">"exec"</span>: <span class="s">"how-many-tokens-left waybar"</span>,
+    <span class="s">"return-type"</span>: <span class="s">"json"</span>,
+    <span class="s">"format"</span>: <span class="s">"{}"</span>,
+    <span class="s">"on-click"</span>: <span class="s">"how-many-tokens-left popover"</span>,
+    <span class="s">"on-click-right"</span>: <span class="s">"how-many-tokens-left refresh"</span>,
+    <span class="s">"on-click-middle"</span>: <span class="s">"how-many-tokens-left dashboard"</span>
+}</pre>
+        <p style="color:#a9a9a9;font-size:14px;margin:0">
+          You need your plaintext management key (<code>remote-management.secret-key</code>).
+          Set it in <code>HMTL_MANAGEMENT_KEY</code>, or in
+          <code>~/.config/how-many-tokens-left/config.toml</code>, or put it in
+          <code>~/.config/cliproxyapi/management-key.txt</code>.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Using it</h2>
+    <div class="two">
+      <ul class="plain">
+        <li><b>Hover</b> for a text breakdown of every account</li>
+        <li><b>Click</b> to open or close the dropdown</li>
+        <li><b>Right-click</b> to poll now</li>
+        <li><b>Middle-click</b> to open the CLIProxyAPI quota page</li>
+      </ul>
+      <ul class="plain">
+        <li><kbd>s</kbd> saves a screenshot of the panel and copies it</li>
+        <li><kbd>p</kbd> pins the panel so region tools like slurp work</li>
+        <li><kbd>r</kbd> refreshes</li>
+        <li><kbd>esc</kbd>, or clicking elsewhere, closes it</li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <h2>How the numbers work</h2>
+    <table>
+      <tr><td>% left</td><td>100 − utilisation, for each account and window. An account with no active 5-hour window hasn't used anything in it yet, so it counts as 100%.</td></tr>
+      <tr><td>mean</td><td>The default. The average % left across accounts: your pool of capacity.</td></tr>
+      <tr><td>min</td><td>The most-drained account.</td></tr>
+      <tr><td>sum</td><td>The total % left, e.g. 165% ≈ 1.65 accounts' worth.</td></tr>
+      <tr><td>bold</td><td>For each account, its binding limit, <code>min(5h, 7d)</code>.</td></tr>
+    </table>
+  </section>
+
+  <footer>
+    <span>MIT · built for <a href="https://github.com/router-for-me/CLIProxyAPI">CLIProxyAPI</a> and <a href="https://github.com/Alexays/Waybar">Waybar</a></span>
+    <span><a href="https://github.com/claridgicus/how-many-tokens-left">github.com/claridgicus/how-many-tokens-left</a></span>
+  </footer>
+</div>
+
+<script>
+// The same ordered dither the panel uses (Bayer 8x8): fill ramps from
+// sparse to solid at its leading edge; the empty track is a faint dither.
+(function () {
+  const B = [
+    [0,32,8,40,2,34,10,42],[48,16,56,24,50,18,58,26],[12,44,4,36,14,46,6,38],[60,28,52,20,62,30,54,22],
+    [3,35,11,43,1,33,9,41],[51,19,59,27,49,17,57,25],[15,47,7,39,13,45,5,37],[63,31,55,23,61,29,53,21]];
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const bars = [...document.querySelectorAll("canvas.dither")];
+
+  function draw(c, pct) {
+    const cell = 2;
+    const w = Math.max(1, Math.floor(c.clientWidth / cell));
+    const h = Math.max(1, Math.floor(c.clientHeight / cell));
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+    const ctx = c.getContext("2d");
+    const img = ctx.createImageData(w, h);
+    const col = c.dataset.color.match(/\w\w/g).map(x => parseInt(x, 16));
+    const strength = c.dataset.dim ? 0.55 : 1;
+    const filled = pct / 100 * w;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const t = (B[y % 8][x % 8] + 0.5) / 64;
+      let on = false, rgb = col, a = 255 * strength;
+      if (x < filled) {
+        const d = filled - x <= 1.5 ? 1 : 0.35 + 0.65 * Math.pow(x / filled, 1.6);
+        on = t < d;
+      } else {
+        on = t < 0.14; rgb = [128, 128, 128]; a = 150;
+      }
+      if (on) { const i = (y * w + x) * 4; img.data[i] = rgb[0]; img.data[i+1] = rgb[1]; img.data[i+2] = rgb[2]; img.data[i+3] = a; }
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  function frame(now) {
+    const k = reduce ? 1 : 1 - Math.pow(1 - Math.min(1, now / 1400), 3);  // ease-out
+    bars.forEach(c => draw(c, +c.dataset.pct * k));
+    if (!reduce && now < 1500) requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  addEventListener("resize", () => bars.forEach(c => draw(c, +c.dataset.pct)));
+
+  const mod = document.getElementById("barmod");
+  mod.addEventListener("click", () => {
+    mod.classList.toggle("open");
+    document.querySelector(".shot").scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "center" });
+  });
+})();
+</script>
+</body>
+</html>

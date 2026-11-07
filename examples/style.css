@@ -1,0 +1,23 @@
+/* Optional: append to ~/.config/waybar/style.css.
+   Text colours come from the module itself (config.toml [colors]);
+   these classes are for borders/backgrounds. */
+#custom-tokens {
+  padding: 0 6px;
+}
+
+#custom-tokens.warning {
+  border-bottom: 1px solid #FFC799;
+}
+
+#custom-tokens.critical {
+  border-bottom: 1px solid #FF8080;
+}
+
+#custom-tokens.error,
+#custom-tokens.stale {
+  opacity: 0.6;
+}
+
+#custom-tokens.open {
+  border-bottom: 1px solid #d8d8d8;
+}

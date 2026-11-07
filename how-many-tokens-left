@@ -1,0 +1,1470 @@
+#!/usr/bin/env python3
+"""how-many-tokens-left: Waybar module showing CLIProxyAPI account quotas.
+
+Polls a CLIProxyAPI management server (the same API behind
+/management.html#/quota) for 5-hour and weekly usage on every Claude and
+Codex account, and renders it as Waybar custom-module JSON.
+
+Subcommands:
+  waybar    run as a continuous Waybar module (default)
+  once      print a single Waybar JSON line and exit
+  status    print a human-readable table to the terminal
+  toggle    expand/collapse the per-account view in the bar
+  refresh   make the running module re-poll right now
+  popover   open/close the dropdown panel (GTK4 + gtk4-layer-shell)
+            --pin keeps it open when focus moves (for screenshot tools)
+  screenshot  save + copy a PNG of the open dropdown (grim, Hyprland)
+  dashboard open the CLIProxyAPI quota page in a browser
+
+Stdlib only; needs Python 3.11+.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+# Fast path for clicks: if the resident dropdown is running, poke it and exit
+# before importing anything heavy, so the panel reacts instantly.
+if len(sys.argv) > 1 and sys.argv[1] == "popover" and "--daemon" not in sys.argv[2:]:
+    try:
+        import signal as _signal
+        _pidfile = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
+                                "how-many-tokens-left", "popover.pid")
+        with open(_pidfile) as _fh:
+            os.kill(int(_fh.read().strip()),
+                    _signal.SIGUSR2 if "--pin" in sys.argv[2:] else _signal.SIGUSR1)
+        sys.exit(0)
+    except (OSError, ValueError):
+        pass  # not running yet: fall through and start it
+
+import argparse
+import html
+import json
+import signal
+import threading
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+APP = "how-many-tokens-left"
+VERSION = "0.1.0"
+
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+XDG_STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+XDG_RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
+
+CONFIG_PATH = XDG_CONFIG / APP / "config.toml"
+STATE_DIR = XDG_STATE / APP
+CACHE_PATH = STATE_DIR / "last.json"
+
+FIVE_HOUR = "5h"
+WEEKLY = "7d"
+WINDOWS = (FIVE_HOUR, WEEKLY)
+
+DEFAULTS = {
+    "url": "http://127.0.0.1:8317",
+    "management_key": "",
+    "management_key_file": "",
+    "interval": 300,
+    "timeout": 20,
+    "providers": ["claude", "codex"],
+    "aggregate": "mean",  # mean | min | sum
+    "warning": 35,
+    "critical": 15,
+    "show_disabled": False,
+    "bar_width": 10,
+    "icons": {"claude": "󰚩", "codex": "󰧑", "default": "󱙺"},
+    "colors": {
+        "ok": "#99FFE4",
+        "warning": "#FFC799",
+        "critical": "#FF8080",
+        "dim": "#808080",
+        "background": "#101010",
+        "foreground": "#d8d8d8",
+    },
+    "popover": {
+        "width": 440,
+        "anchor": "cursor",  # cursor | left | center | right
+        "margin": 6,
+        "dither_cell": 2,  # dither pixel size, in device pixels
+        "close_on_focus_loss": True,
+        "preload": True,  # keep the panel resident so clicks open it instantly
+    },
+    "aliases": {},
+}
+
+# Fallback places a CLIProxyAPI management key commonly lives.
+KEY_FILE_CANDIDATES = [
+    XDG_CONFIG / APP / "management-key",
+    XDG_CONFIG / "cliproxyapi" / "management-key.txt",
+]
+
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_HEADERS = {
+    "Authorization": "Bearer $TOKEN$",
+    "Content-Type": "application/json",
+    "anthropic-beta": "oauth-2025-04-20",
+    "User-Agent": "claude-cli/2.1.280 (external, cli)",
+}
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CODEX_HEADERS = {
+    "Authorization": "Bearer $TOKEN$",
+    "Content-Type": "application/json",
+    "User-Agent": "codex-tui/0.149.1",
+}
+
+
+# --------------------------------------------------------------------------
+# config
+
+
+def load_config(path: Path | None = None) -> dict:
+    cfg = json.loads(json.dumps(DEFAULTS))
+    path = path or CONFIG_PATH
+    if path.exists():
+        with path.open("rb") as fh:
+            user = tomllib.load(fh)
+        for key, value in user.items():
+            if isinstance(value, dict) and isinstance(cfg.get(key), dict):
+                cfg[key].update(value)
+            else:
+                cfg[key] = value
+    if os.environ.get("HMTL_URL"):
+        cfg["url"] = os.environ["HMTL_URL"]
+    if os.environ.get("HMTL_MANAGEMENT_KEY"):
+        cfg["management_key"] = os.environ["HMTL_MANAGEMENT_KEY"]
+    cfg["url"] = cfg["url"].rstrip("/")
+    return cfg
+
+
+def resolve_key(cfg: dict) -> str:
+    if cfg.get("management_key"):
+        return cfg["management_key"].strip()
+    candidates = []
+    if cfg.get("management_key_file"):
+        candidates.append(Path(os.path.expanduser(cfg["management_key_file"])))
+    candidates += KEY_FILE_CANDIDATES
+    for p in candidates:
+        try:
+            key = p.read_text().strip()
+        except OSError:
+            continue
+        if key:
+            return key
+    raise QuotaError(
+        "no management key: set management_key in "
+        f"{CONFIG_PATH} or HMTL_MANAGEMENT_KEY"
+    )
+
+
+# --------------------------------------------------------------------------
+# model
+
+
+class QuotaError(Exception):
+    pass
+
+
+@dataclass
+class Window:
+    used: float  # percent 0-100
+    resets_at: float | None = None  # epoch seconds
+
+    @property
+    def remaining(self) -> float:
+        return max(0.0, min(100.0, 100.0 - self.used))
+
+
+@dataclass
+class Account:
+    provider: str
+    email: str
+    label: str
+    status: str = "active"
+    disabled: bool = False
+    plan: str = ""
+    windows: dict[str, Window] = field(default_factory=dict)
+    source: str = "live"  # live | cached | none
+    error: str = ""
+
+    def remaining(self, win: str) -> float | None:
+        if self.source == "none":
+            return None
+        w = self.windows.get(win)
+        # No active window (e.g. Claude returns five_hour: null when idle)
+        # means nothing has been consumed in it yet.
+        return w.remaining if w else 100.0
+
+    def has_window(self, win: str) -> bool:
+        return win in self.windows
+
+    @property
+    def effective(self) -> float | None:
+        vals = [self.remaining(w) for w in WINDOWS]
+        vals = [v for v in vals if v is not None]
+        return min(vals) if vals else None
+
+
+# --------------------------------------------------------------------------
+# fetching
+
+
+class Client:
+    def __init__(self, cfg: dict):
+        self.base = cfg["url"] + "/v0/management"
+        self.key = resolve_key(cfg)
+        self.timeout = cfg["timeout"]
+
+    def _req(self, method: str, path: str, body: dict | None = None) -> dict:
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(
+            self.base + path,
+            data=data,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {self.key}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise QuotaError("management key rejected") from e
+            raise QuotaError(f"management API HTTP {e.code}") from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise QuotaError(f"cannot reach {self.base}: {e}") from e
+
+    def auth_files(self) -> list[dict]:
+        return self._req("GET", "/auth-files").get("files", [])
+
+    def api_call(self, auth_index: str, url: str, headers: dict) -> dict:
+        resp = self._req(
+            "POST",
+            "/api-call",
+            {"auth_index": auth_index, "method": "GET", "url": url, "header": headers},
+        )
+        code = int(resp.get("status_code") or 0)
+        body = resp.get("body")
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except ValueError:
+                pass
+        if not 200 <= code < 300:
+            raise QuotaError(f"upstream HTTP {code}")
+        if not isinstance(body, dict):
+            raise QuotaError("upstream returned no JSON")
+        return body
+
+
+def _iso_to_epoch(value) -> float | None:
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+
+def _window_name(seconds: float | None) -> str | None:
+    if not seconds:
+        return None
+    hours = seconds / 3600
+    if hours <= 6:
+        return FIVE_HOUR
+    if 6 * 24 <= hours <= 8 * 24:
+        return WEEKLY
+    return None
+
+
+def parse_claude_usage(body: dict) -> dict[str, Window]:
+    out = {}
+    for key, win in (("five_hour", FIVE_HOUR), ("seven_day", WEEKLY)):
+        w = body.get(key)
+        if isinstance(w, dict) and w.get("utilization") is not None:
+            out[win] = Window(float(w["utilization"]), _iso_to_epoch(w.get("resets_at")))
+    return out
+
+
+def parse_codex_usage(body: dict) -> dict[str, Window]:
+    out = {}
+    rl = body.get("rate_limit") or {}
+    for key in ("primary_window", "secondary_window"):
+        w = rl.get(key)
+        if not isinstance(w, dict) or w.get("used_percent") is None:
+            continue
+        name = _window_name(w.get("limit_window_seconds"))
+        if name:
+            reset = w.get("reset_at")
+            if reset is None and w.get("reset_after_seconds") is not None:
+                reset = time.time() + float(w["reset_after_seconds"])
+            out[name] = Window(float(w["used_percent"]), _iso_to_epoch(reset))
+    return out
+
+
+def parse_signals(provider: str, signals: dict) -> dict[str, Window]:
+    """Quota headers CLIProxyAPI recorded from the last proxied request."""
+    s = {k.lower(): v for k, v in (signals or {}).items()}
+    out = {}
+    if provider == "claude":
+        for tag, win in (("5h", FIVE_HOUR), ("7d", WEEKLY)):
+            util = s.get(f"anthropic-ratelimit-unified-{tag}-utilization")
+            if util is None:
+                continue
+            reset = _iso_to_epoch(s.get(f"anthropic-ratelimit-unified-{tag}-reset"))
+            if reset and reset < time.time():
+                continue  # window already rolled over; data is stale
+            out[win] = Window(float(util) * 100, reset)
+    elif provider == "codex":
+        for slot in ("primary", "secondary"):
+            minutes = s.get(f"x-codex-{slot}-window-minutes")
+            used = s.get(f"x-codex-{slot}-used-percent")
+            name = _window_name(float(minutes) * 60) if minutes else None
+            if name and used is not None:
+                reset = _iso_to_epoch(s.get(f"x-codex-{slot}-reset-at"))
+                if reset and reset < time.time():
+                    continue
+                out[name] = Window(float(used), reset)
+    return out
+
+
+def make_label(email: str, aliases: dict) -> str:
+    if email in aliases:
+        return aliases[email]
+    if "@" in email:
+        local, domain = email.split("@", 1)
+        return domain.split(".")[0] or local
+    return email or "?"
+
+
+FETCHERS = {
+    "claude": (CLAUDE_USAGE_URL, CLAUDE_HEADERS, parse_claude_usage),
+    "codex": (CODEX_USAGE_URL, CODEX_HEADERS, parse_codex_usage),
+}
+
+
+def fetch_account(client: Client, f: dict, cfg: dict) -> Account:
+    provider = f.get("type") or f.get("provider")
+    email = f.get("email") or f.get("account") or f.get("name", "")
+    acct = Account(
+        provider=provider,
+        email=email,
+        label=make_label(email, cfg["aliases"]),
+        status=f.get("status", ""),
+        disabled=bool(f.get("disabled")),
+        plan=((f.get("id_token") or {}).get("plan_type") or f.get("account_type") or ""),
+    )
+    url, headers, parser = FETCHERS[provider]
+    headers = dict(headers)
+    if provider == "codex":
+        acct_id = (f.get("id_token") or {}).get("chatgpt_account_id")
+        if acct_id:
+            headers["Chatgpt-Account-Id"] = acct_id
+    try:
+        body = client.api_call(f["auth_index"], url, headers)
+        acct.windows = parser(body)
+        if provider == "codex" and body.get("plan_type"):
+            acct.plan = body["plan_type"]
+    except (QuotaError, KeyError) as e:
+        acct.error = str(e)
+        acct.windows = parse_signals(provider, (f.get("quota") or {}).get("signals"))
+        acct.source = "cached" if acct.windows else "none"
+    return acct
+
+
+def fetch_all(cfg: dict) -> list[Account]:
+    client = Client(cfg)
+    files = [
+        f
+        for f in client.auth_files()
+        if (f.get("type") or f.get("provider")) in cfg["providers"]
+        and (f.get("type") or f.get("provider")) in FETCHERS
+        and f.get("auth_index")
+        and (cfg["show_disabled"] or not f.get("disabled"))
+    ]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        accounts = list(pool.map(lambda f: fetch_account(client, f, cfg), files))
+    order = {p: i for i, p in enumerate(cfg["providers"])}
+    accounts.sort(key=lambda a: (order.get(a.provider, 99), a.email))
+    return accounts
+
+
+# --------------------------------------------------------------------------
+# aggregation
+
+
+def pool(accounts: list[Account], win: str, how: str) -> float | None:
+    vals = [a.remaining(win) for a in accounts if not a.disabled]
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    if how == "min":
+        return min(vals)
+    if how == "sum":
+        return sum(vals)
+    return sum(vals) / len(vals)
+
+
+def provider_summary(accounts: list[Account], cfg: dict) -> dict[str, dict]:
+    out = {}
+    for provider in cfg["providers"]:
+        accts = [a for a in accounts if a.provider == provider]
+        if not accts:
+            continue
+        wins = {}
+        for win in WINDOWS:
+            # Only show a window if at least one account actually has it.
+            if any(a.has_window(win) for a in accts):
+                wins[win] = pool(accts, win, cfg["aggregate"])
+        if not wins:
+            wins[WEEKLY] = pool(accts, WEEKLY, cfg["aggregate"])
+        out[provider] = wins
+    return out
+
+
+def severity(pct: float | None, cfg: dict) -> str:
+    if pct is None:
+        return "error"
+    if pct < cfg["critical"]:
+        return "critical"
+    if pct < cfg["warning"]:
+        return "warning"
+    return "ok"
+
+
+# --------------------------------------------------------------------------
+# rendering
+
+
+def esc(s: str) -> str:
+    return html.escape(str(s), quote=False)
+
+
+def span(text: str, color: str | None = None, bold: bool = False, alpha: str | None = None) -> str:
+    attrs = []
+    if color:
+        attrs.append(f"foreground='{color}'")
+    if bold:
+        attrs.append("weight='bold'")
+    if alpha:
+        attrs.append(f"alpha='{alpha}'")
+    return f"<span {' '.join(attrs)}>{text}</span>" if attrs else text
+
+
+def fmt_pct(p: float | None) -> str:
+    return "?" if p is None else f"{p:.0f}%"
+
+
+def fmt_reset(epoch: float | None, now: float | None = None) -> str:
+    if not epoch:
+        return "—"
+    delta = int(epoch - (now or time.time()))
+    if delta <= 0:
+        return "now"
+    d, rem = divmod(delta, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m:02d}m"
+    return f"{m}m"
+
+
+def meter(pct: float | None, width: int) -> str:
+    if pct is None:
+        return "·" * width
+    filled = round(pct / 100 * width)
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+def render_windows(wins: dict[str, float | None], cfg: dict) -> str:
+    """'5h 72% · 7d 38%' with the binding (smallest) window highlighted."""
+    known = [v for v in wins.values() if v is not None]
+    lowest = min(known) if known else None
+    parts = []
+    for win, val in wins.items():
+        txt = f"{win} {fmt_pct(val)}"
+        if val is not None and val == lowest:
+            parts.append(span(esc(txt), cfg["colors"][severity(val, cfg)], bold=True))
+        else:
+            parts.append(span(esc(txt), cfg["colors"]["dim"]))
+    return " ".join(parts)
+
+
+def render_text(accounts: list[Account], cfg: dict, expanded: bool) -> str:
+    summary = provider_summary(accounts, cfg)
+    icons = cfg["icons"]
+    chunks = []
+    for provider, wins in summary.items():
+        icon = icons.get(provider, icons.get("default", ""))
+        if expanded:
+            accts = [a for a in accounts if a.provider == provider]
+            per = []
+            for a in accts:
+                eff = a.effective
+                col = cfg["colors"][severity(eff, cfg)]
+                per.append(f"{esc(a.label)} {span(fmt_pct(eff), col, bold=True)}")
+            chunks.append(f"{icon} " + span(" · ", cfg["colors"]["dim"]).join(per))
+        else:
+            chunks.append(f"{icon} {render_windows(wins, cfg)}")
+    if not chunks:
+        return f"{icons.get('default', '')} –"
+    return span("  │  ", cfg["colors"]["dim"]).join(chunks)
+
+
+def render_tooltip(accounts: list[Account], cfg: dict, fetched_at: float) -> str:
+    summary = provider_summary(accounts, cfg)
+    width = cfg["bar_width"]
+    label_w = max([len(a.label) for a in accounts] + [6])
+    lines = [
+        span("How Many Tokens Left", bold=True)
+        + span(f"   updated {datetime.fromtimestamp(fetched_at).strftime('%H:%M')}", cfg["colors"]["dim"])
+    ]
+    for provider, wins in summary.items():
+        icon = cfg["icons"].get(provider, cfg["icons"].get("default", ""))
+        how = {"mean": "pool", "min": "worst", "sum": "total"}.get(cfg["aggregate"], "")
+        lines.append("")
+        lines.append(f"{icon} {span(provider.title(), bold=True)}  {span(how, cfg['colors']['dim'])} {render_windows(wins, cfg)}")
+        for a in [a for a in accounts if a.provider == provider]:
+            name = esc(a.label.ljust(label_w))
+            if a.source == "none":
+                lines.append(f"  {name}  " + span(esc(f"unavailable: {a.error}"), cfg["colors"]["critical"]))
+                continue
+            cells = []
+            for win in wins:
+                rem = a.remaining(win)
+                w = a.windows.get(win)
+                col = cfg["colors"][severity(rem, cfg)]
+                eff = a.effective
+                bold = rem is not None and eff is not None and rem == eff
+                cells.append(
+                    f"{win} "
+                    + span(meter(rem, width), col)
+                    + " "
+                    + span(fmt_pct(rem).rjust(4), col, bold=bold)
+                    + span(" ↻ " + fmt_reset(w.resets_at if w else None).ljust(7), cfg["colors"]["dim"])
+                )
+            tag = ""
+            if a.source == "cached":
+                tag = span("  (cached)", cfg["colors"]["warning"])
+            if a.disabled:
+                tag += span("  (disabled)", cfg["colors"]["dim"])
+            lines.append(f"  {name}  " + "  ".join(cells) + tag)
+    lines.append("")
+    lines.append(span("click: details · right-click: refresh · middle: dashboard", cfg["colors"]["dim"]))
+    return f"<tt>{chr(10).join(lines)}</tt>"
+
+
+def render_waybar(accounts: list[Account], cfg: dict, expanded: bool, fetched_at: float) -> dict:
+    summary = provider_summary(accounts, cfg)
+    known = [v for wins in summary.values() for v in wins.values() if v is not None]
+    lowest = min(known) if known else None
+    sev = severity(lowest, cfg)
+    classes = [sev]
+    if expanded:
+        classes.append("expanded")
+    return {
+        "text": render_text(accounts, cfg, expanded),
+        "tooltip": render_tooltip(accounts, cfg, fetched_at),
+        "class": classes,
+        "percentage": int(round(lowest)) if lowest is not None else 0,
+        "alt": sev,
+    }
+
+
+def render_error(err: str, cfg: dict) -> dict:
+    icon = cfg["icons"].get("default", "")
+    return {
+        "text": f"{icon} {span('!', cfg['colors']['critical'], bold=True)}",
+        "tooltip": f"<tt>{span('How Many Tokens Left', bold=True)}\n\n{esc(err)}</tt>",
+        "class": ["error"],
+        "percentage": 0,
+        "alt": "error",
+    }
+
+
+# --------------------------------------------------------------------------
+# state & cache
+#
+# Waybar starts one module process per bar (i.e. per monitor). They share
+# one cache + lock so only one of them polls the API, and one runtime dir
+# so a click toggles every bar at once.
+
+RUN_DIR = XDG_RUNTIME / APP
+PIDS_DIR = RUN_DIR / "pids"
+EXPANDED_FLAG = RUN_DIR / "expanded"
+POPOVER_PID = RUN_DIR / "popover.pid"
+POPOVER_OPEN = RUN_DIR / "popover-open"
+POPOVER_LOCK = RUN_DIR / "popover.lock"
+LOCK_PATH = RUN_DIR / "fetch.lock"
+
+
+@dataclass
+class Snapshot:
+    accounts: list[Account]
+    fetched_at: float = 0.0  # last successful poll
+    attempted_at: float = 0.0  # last poll attempt, successful or not
+    error: str = ""
+
+
+def save_cache(snap: Snapshot) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        data = {
+            "fetched_at": snap.fetched_at,
+            "attempted_at": snap.attempted_at,
+            "error": snap.error,
+            "accounts": [
+                {
+                    **{k: v for k, v in a.__dict__.items() if k != "windows"},
+                    "windows": {k: w.__dict__ for k, w in a.windows.items()},
+                }
+                for a in snap.accounts
+            ],
+        }
+        tmp = CACHE_PATH.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(data, indent=1))
+        tmp.replace(CACHE_PATH)
+    except OSError:
+        pass
+
+
+def demo_snapshot() -> Snapshot:
+    """Made-up accounts for screenshots and trying the UI (HMTL_DEMO=1)."""
+    now = time.time()
+    h, d = 3600, 86400
+
+    def a(provider, email, label, plan="", **wins):
+        w = {k[1:]: Window(used, now + reset) for k, (used, reset) in wins.items()}
+        return Account(provider, email, label, plan=plan, windows=w)
+
+    return Snapshot([
+        a("claude", "ada@example.com", "work", "max", w5h=(38, 2 * h + 14 * 60), w7d=(71, 3 * d + 5 * h)),
+        a("claude", "ada@personal.dev", "personal", "max", w7d=(22, 6 * d + 1 * h)),
+        a("claude", "ada@sideproject.io", "side", "pro", w5h=(91, 41 * 60), w7d=(64, 1 * d + 9 * h)),
+        a("claude", "ada@lab.example.org", "lab", "pro", w7d=(100, 9 * h + 30 * 60)),
+        a("codex", "ada@example.com", "work", "pro", w7d=(43, 4 * d + 2 * h)),
+    ], now, now)
+
+
+def load_cache() -> Snapshot | None:
+    if os.environ.get("HMTL_DEMO"):
+        return demo_snapshot()
+    try:
+        data = json.loads(CACHE_PATH.read_text())
+        accounts = []
+        for a in data.get("accounts", []):
+            wins = {k: Window(**w) for k, w in a.pop("windows", {}).items()}
+            accounts.append(Account(**a, windows=wins))
+    except (OSError, ValueError, TypeError):
+        return None
+    fetched = data.get("fetched_at", 0)
+    return Snapshot(accounts, fetched, data.get("attempted_at", fetched), data.get("error", ""))
+
+
+def poll(cfg: dict) -> Snapshot:
+    """Fetch now, keeping the previous accounts if the poll fails."""
+    if os.environ.get("HMTL_DEMO"):
+        return demo_snapshot()
+    now = time.time()
+    try:
+        snap = Snapshot(fetch_all(cfg), now, now)
+    except QuotaError as e:
+        prev = load_cache() or Snapshot([])
+        snap = Snapshot(prev.accounts, prev.fetched_at, now, str(e))
+    save_cache(snap)
+    return snap
+
+
+def shared_poll(cfg: dict, newer_than: float) -> Snapshot:
+    """Return a snapshot attempted at or after `newer_than`, polling only if
+    no other module process already has one."""
+    if os.environ.get("HMTL_DEMO"):
+        return demo_snapshot()
+    import fcntl
+
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_PATH, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        snap = load_cache()
+        if snap and snap.attempted_at >= newer_than:
+            return snap
+        return poll(cfg)
+
+
+def is_expanded() -> bool:
+    return EXPANDED_FLAG.exists()
+
+
+def running_pids() -> list[int]:
+    pids = []
+    try:
+        entries = list(PIDS_DIR.iterdir())
+    except OSError:
+        return pids
+    for entry in entries:
+        try:
+            pid = int(entry.name)
+            os.kill(pid, 0)
+            pids.append(pid)
+        except (ValueError, ProcessLookupError):
+            entry.unlink(missing_ok=True)
+        except PermissionError:
+            pass
+    return pids
+
+
+# --------------------------------------------------------------------------
+# commands
+
+
+def emit(obj: dict) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def render_snapshot(snap: Snapshot, cfg: dict) -> dict:
+    if not snap.accounts:
+        return render_error(snap.error or "no accounts found", cfg)
+    out = render_waybar(snap.accounts, cfg, is_expanded(), snap.fetched_at)
+    if POPOVER_OPEN.exists() and popover_pid():
+        out["class"].append("open")
+    if snap.error:
+        out["tooltip"] = out["tooltip"].replace(
+            "</tt>",
+            "\n" + span(esc(f"last poll failed: {snap.error}"), cfg["colors"]["critical"]) + "</tt>",
+        )
+        out["class"].append("stale")
+    return out
+
+
+def cmd_waybar(cfg: dict) -> int:
+    wake = threading.Event()
+    forced = {"at": 0.0}
+
+    def on_rerender(*_):
+        wake.set()
+
+    def on_refresh(*_):
+        forced["at"] = time.time()
+        wake.set()
+
+    signal.signal(signal.SIGUSR1, on_rerender)
+    signal.signal(signal.SIGUSR2, on_refresh)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    PIDS_DIR.mkdir(parents=True, exist_ok=True)
+    pid_file = PIDS_DIR / str(os.getpid())
+    pid_file.touch()
+    if cfg["popover"].get("preload"):
+        try:
+            ensure_popover_daemon()
+        except OSError:
+            pass
+
+    try:
+        snap = load_cache()
+        if snap:
+            emit(render_snapshot(snap, cfg))  # show last numbers immediately
+        while True:
+            now = time.time()
+            if forced["at"]:
+                snap = shared_poll(cfg, forced["at"])
+                forced["at"] = 0.0
+            elif not snap or now - snap.attempted_at >= cfg["interval"]:
+                snap = shared_poll(cfg, now - cfg["interval"])
+            emit(render_snapshot(snap, cfg))
+            wake.clear()
+            # Re-render at least once a minute so reset countdowns tick.
+            until_due = cfg["interval"] - (time.time() - snap.attempted_at)
+            wake.wait(max(1.0, min(60.0, until_due)))
+    except BrokenPipeError:
+        return 0
+    finally:
+        pid_file.unlink(missing_ok=True)
+
+
+def cmd_once(cfg: dict) -> int:
+    snap = poll(cfg)
+    emit(render_snapshot(snap, cfg))
+    return 1 if snap.error else 0
+
+
+ANSI = {"ok": "\033[32m", "warning": "\033[33m", "critical": "\033[31m", "error": "\033[31m"}
+RESET = "\033[0m"
+
+
+def cmd_status(cfg: dict, as_json: bool) -> int:
+    try:
+        accounts = fetch_all(cfg)
+    except QuotaError as e:
+        print(f"{APP}: {e}", file=sys.stderr)
+        return 1
+    now = time.time()
+    save_cache(Snapshot(accounts, now, now))
+    if as_json:
+        summary = provider_summary(accounts, cfg)
+        print(json.dumps({
+            "summary": summary,
+            "accounts": [
+                {
+                    "provider": a.provider, "email": a.email, "label": a.label,
+                    "plan": a.plan, "source": a.source, "error": a.error,
+                    "remaining": {w: a.remaining(w) for w in WINDOWS},
+                    "resets_at": {k: v.resets_at for k, v in a.windows.items()},
+                }
+                for a in accounts
+            ],
+        }, indent=2))
+        return 0
+    color = sys.stdout.isatty()
+
+    def c(text, sev):
+        return f"{ANSI[sev]}{text}{RESET}" if color else text
+
+    summary = provider_summary(accounts, cfg)
+    for provider, wins in summary.items():
+        head = "  ".join(f"{w} {c(fmt_pct(v), severity(v, cfg))}" for w, v in wins.items())
+        print(f"{provider.title()}  ({cfg['aggregate']})  {head}")
+        for a in [a for a in accounts if a.provider == provider]:
+            if a.source == "none":
+                print(f"  {a.email:<34} unavailable: {a.error}")
+                continue
+            cells = []
+            for w in wins:
+                rem = a.remaining(w)
+                win = a.windows.get(w)
+                cells.append(f"{w} {c(fmt_pct(rem).rjust(4), severity(rem, cfg))} (resets {fmt_reset(win.resets_at if win else None)})")
+            tag = " [cached]" if a.source == "cached" else ""
+            print(f"  {a.email:<34} " + "   ".join(cells) + tag)
+        print()
+    return 0
+
+
+# --------------------------------------------------------------------------
+# dithered bars (pure; used by the popover)
+
+BAYER8 = [
+    [0, 32, 8, 40, 2, 34, 10, 42],
+    [48, 16, 56, 24, 50, 18, 58, 26],
+    [12, 44, 4, 36, 14, 46, 6, 38],
+    [60, 28, 52, 20, 62, 30, 54, 22],
+    [3, 35, 11, 43, 1, 33, 9, 41],
+    [51, 19, 59, 27, 49, 17, 57, 25],
+    [15, 47, 7, 39, 13, 45, 5, 37],
+    [63, 31, 55, 23, 61, 29, 53, 21],
+]
+
+
+def hex_rgb(color: str) -> tuple[int, int, int]:
+    c = color.lstrip("#")
+    if len(c) == 3:
+        c = "".join(ch * 2 for ch in c)
+    return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+
+
+def dither_bar(pct: float | None, width: int, height: int, cell: int,
+               fill: tuple[int, int, int], track: tuple[int, int, int],
+               strength: float = 1.0) -> bytes:
+    """RGBA pixels for an ordered-dither (Bayer 8x8) progress bar.
+
+    The filled part ramps from a sparse dither on the left to solid at the
+    leading edge; the empty track is a faint dither in the track colour.
+    """
+    cell = max(1, cell)
+    cols = max(1, -(-width // cell))
+    rows = max(1, -(-height // cell))
+    filled = 0.0 if pct is None else max(0.0, min(100.0, pct)) / 100 * cols
+    fa = int(255 * strength)
+    on_fill = bytes((*fill, fa))
+    on_track = bytes((*track, 150))
+    off = bytes(4)
+    cell_rows = []
+    for cy in range(rows):
+        bay = BAYER8[cy % 8]
+        line = bytearray()
+        for cx in range(cols):
+            t = (bay[cx % 8] + 0.5) / 64
+            if cx < filled:
+                # ramp 0.35 -> 1.0 towards the leading edge; last cells solid
+                density = 1.0 if filled - cx <= 1.5 else 0.35 + 0.65 * (cx / filled) ** 1.6
+                px = on_fill if t < density else off
+            else:
+                px = on_track if t < 0.14 else off
+            line += px * cell
+        line = bytes(line[: width * 4])
+        cell_rows.append(line)
+    out = bytearray()
+    for y in range(height):
+        out += cell_rows[y // cell]
+    return bytes(out)
+
+
+def popover_pid() -> int | None:
+    try:
+        pid = int(POPOVER_PID.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def _hypr_cursor() -> tuple[str, float] | None:
+    """(connector, cursor x relative to that monitor) via Hyprland, if present."""
+    import subprocess
+    try:
+        pos = subprocess.run(["hyprctl", "-j", "cursorpos"], capture_output=True, timeout=2, text=True)
+        mons = subprocess.run(["hyprctl", "-j", "monitors"], capture_output=True, timeout=2, text=True)
+        cur = json.loads(pos.stdout)
+        for m in json.loads(mons.stdout):
+            scale = m.get("scale") or 1
+            w, h = m["width"] / scale, m["height"] / scale
+            if m.get("transform", 0) % 2:
+                w, h = h, w
+            if m["x"] <= cur["x"] < m["x"] + w and m["y"] <= cur["y"] < m["y"] + h:
+                return m["name"], cur["x"] - m["x"]
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _find_layer_shell_lib() -> str | None:
+    import ctypes.util
+    for p in ("/usr/lib/libgtk4-layer-shell.so.0", "/usr/lib64/libgtk4-layer-shell.so.0",
+              "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0",
+              "/usr/lib/aarch64-linux-gnu/libgtk4-layer-shell.so.0"):
+        if os.path.exists(p):
+            return p
+    name = ctypes.util.find_library("gtk4-layer-shell")
+    return name
+
+
+def capture_panel(path: str | None = None, copy: bool = True) -> str:
+    """Screenshot the open dropdown with grim; returns the saved path."""
+    import shutil
+    import subprocess
+    if not shutil.which("grim"):
+        raise QuotaError("screenshot needs grim")
+    geom = None
+    try:
+        layers = json.loads(subprocess.run(["hyprctl", "-j", "layers"], capture_output=True,
+                                           text=True, timeout=2).stdout)
+        for mon in layers.values():
+            for level in mon.get("levels", {}).values():
+                for layer in level:
+                    if layer.get("namespace") == APP:
+                        # trim the transparent shadow margin (css: 2px 8px 14px 8px)
+                        geom = f"{layer['x'] + 8},{layer['y'] + 2} {layer['w'] - 16}x{layer['h'] - 16}"
+    except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+        pass
+    if not geom:
+        raise QuotaError("dropdown isn't open (or not on Hyprland); use your own screenshot tool with `popover --pin`")
+    if not path:
+        pics = Path(os.environ.get("XDG_PICTURES_DIR") or Path.home() / "Pictures")
+        pics.mkdir(parents=True, exist_ok=True)
+        path = str(pics / f"tokens-left-{datetime.now():%Y%m%d-%H%M%S}.png")
+    subprocess.run(["grim", "-g", geom, path], check=True, timeout=10)
+    if copy and shutil.which("wl-copy"):
+        with open(path, "rb") as fh:
+            subprocess.Popen(["wl-copy", "--type", "image/png"], stdin=fh)
+    return path
+
+
+def _popover_available() -> bool:
+    import importlib.util
+    return bool(_find_layer_shell_lib()) and importlib.util.find_spec("gi") is not None
+
+
+def ensure_popover_daemon() -> None:
+    """Start the hidden, resident dropdown once (shared by every bar)."""
+    import fcntl
+    import subprocess
+    if popover_pid() or not _popover_available():
+        return
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    with open(POPOVER_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if popover_pid():
+            return
+        child = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "popover", "--daemon"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        # The pid survives the daemon's LD_PRELOAD re-exec, so claim it now.
+        POPOVER_PID.write_text(str(child.pid))
+
+
+def cmd_popover(cfg: dict, pin: bool = False, daemon: bool = False) -> int:
+    """Without --daemon: toggle the resident panel (starting it if needed).
+    With --daemon: be the resident panel, hidden until signalled."""
+    pid = popover_pid()
+    if pid and pid != os.getpid():
+        if daemon:
+            return 0  # one is already resident
+        os.kill(pid, signal.SIGUSR2 if pin else signal.SIGUSR1)
+        return 0
+    show_on_start = not daemon
+
+    # gtk4-layer-shell must be loaded before libwayland-client.
+    if "gtk4-layer-shell" not in os.environ.get("LD_PRELOAD", ""):
+        lib = _find_layer_shell_lib()
+        if not lib:
+            print(f"{APP}: popover needs gtk4-layer-shell", file=sys.stderr)
+            return 1
+        env = dict(os.environ)
+        env["LD_PRELOAD"] = (lib + " " + env.get("LD_PRELOAD", "")).strip()
+        args = ["popover", "--daemon"] + (["--show"] if show_on_start else []) + (["--pin"] if pin else [])
+        os.execve(sys.executable, [sys.executable, os.path.abspath(__file__), *args], env)
+
+    try:
+        import gi
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Gdk", "4.0")
+        gi.require_version("Gsk", "4.0")
+        gi.require_version("Graphene", "1.0")
+        gi.require_version("Gtk4LayerShell", "1.0")
+        from gi.repository import Gdk, GLib, Graphene, Gsk, Gtk
+        from gi.repository import Gtk4LayerShell as LayerShell
+    except (ImportError, ValueError) as e:
+        print(f"{APP}: popover needs python-gobject, gtk4 and gtk4-layer-shell ({e})", file=sys.stderr)
+        return 1
+
+    pc = cfg["popover"]
+    colors = cfg["colors"]
+    track_rgb = hex_rgb(colors["dim"])
+
+    class DitherBar(Gtk.Widget):
+        def __init__(self, pct, color, strength=1.0, height=10):
+            super().__init__()
+            self.pct, self.rgb, self.strength = pct, hex_rgb(color), strength
+            self.set_size_request(60, height)
+            self.set_hexpand(True)
+            self.set_valign(Gtk.Align.CENTER)
+            self._tex = None
+            self._key = None
+
+        def do_snapshot(self, snap):
+            w, h = self.get_width(), self.get_height()
+            if w <= 0 or h <= 0:
+                return
+            native = self.get_native()
+            surface = native.get_surface() if native else None
+            scale = surface.get_scale() if surface and hasattr(surface, "get_scale") else self.get_scale_factor()
+            dw, dh = max(1, round(w * scale)), max(1, round(h * scale))
+            key = (dw, dh)
+            if key != self._key:
+                data = dither_bar(self.pct, dw, dh, pc["dither_cell"], self.rgb, track_rgb, self.strength)
+                self._tex = Gdk.MemoryTexture.new(dw, dh, Gdk.MemoryFormat.R8G8B8A8, GLib.Bytes.new(data), dw * 4)
+                self._key = key
+            rect = Graphene.Rect().init(0, 0, w, h)
+            snap.append_scaled_texture(self._tex, Gsk.ScalingFilter.NEAREST, rect)
+
+    css = f"""
+    window.hmtl {{ background: transparent; }}
+    .hmtl-panel {{
+        background: {colors['background']};
+        color: {colors['foreground']};
+        border: 1px solid alpha({colors['foreground']}, 0.14);
+        border-radius: 4px;
+        padding: 12px 14px 10px 14px;
+        font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace;
+        font-size: 11px;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.55);
+        margin: 2px 8px 14px 8px;
+    }}
+    .hmtl-title {{ font-weight: 900; letter-spacing: 2px; }}
+    .hmtl-section {{ font-size: 9px; font-weight: 700; letter-spacing: 2px;
+                     color: {colors['dim']}; margin-top: 12px; margin-bottom: 2px; }}
+    .hmtl-dim {{ color: {colors['dim']}; }}
+    .hmtl-small {{ font-size: 9px; }}
+    .hmtl-name {{ font-weight: 800; margin-top: 6px; }}
+    .hmtl-pct {{ font-weight: 900; }}
+    .hmtl-flash {{ color: {colors['ok']}; }}
+    .hmtl-err {{ color: {colors['critical']}; }}
+    .hmtl-rule {{ background: alpha({colors['foreground']}, 0.10); min-height: 1px; margin-top: 10px; }}
+    button.hmtl-btn {{ background: none; border: none; box-shadow: none; padding: 0 2px;
+                       min-height: 0; min-width: 0; color: {colors['dim']}; }}
+    button.hmtl-btn:hover {{ color: {colors['foreground']}; }}
+    """
+
+    def label(text, *classes, xalign=0.0, markup=False, width_chars=None):
+        lbl = Gtk.Label()
+        if markup:
+            lbl.set_markup(text)
+        else:
+            lbl.set_text(text)
+        lbl.set_xalign(xalign)
+        for c in classes:
+            lbl.add_css_class(c)
+        if width_chars:
+            lbl.set_width_chars(width_chars)
+        return lbl
+
+    def colored_pct(pct, bold=True):
+        col = colors[severity(pct, cfg)]
+        weight = "900" if bold else "400"
+        return f"<span foreground='{col}' weight='{weight}'>{esc(fmt_pct(pct))}</span>"
+
+    def ago(ts):
+        if not ts:
+            return "never"
+        d = int(time.time() - ts)
+        return "just now" if d < 45 else f"{d // 60}m ago" if d < 3600 else f"{d // 3600}h ago"
+
+    def add_row(grid, row, win, pct, emph, reset=None, show_reset=True):
+        col = colors[severity(pct, cfg)] if pct is not None else colors["dim"]
+        grid.attach(label(win, "hmtl-dim", width_chars=3), 0, row, 1, 1)
+        grid.attach(DitherBar(pct, col, 1.0 if emph else 0.45), 1, row, 1, 1)
+        grid.attach(label(colored_pct(pct, emph), "hmtl-pct", markup=True, xalign=1.0, width_chars=5), 2, row, 1, 1)
+        if show_reset:
+            grid.attach(label("↻ " + fmt_reset(reset), "hmtl-dim", "hmtl-small", width_chars=9), 3, row, 1, 1)
+
+    def new_grid():
+        g = Gtk.Grid()
+        g.set_column_spacing(10)
+        g.set_row_spacing(3)
+        return g
+
+    def build(panel):
+        child = panel.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            panel.remove(child)
+            child = nxt
+
+        snap = load_cache()
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        head.append(label("TOKENS LEFT", "hmtl-title"))
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        head.append(spacer)
+        if state["flash"] and time.time() < state["flash_until"]:
+            head.append(label(state["flash"], "hmtl-small", "hmtl-flash"))
+        else:
+            if state["pinned"]:
+                head.append(label("󰐃 pinned", "hmtl-small", "hmtl-flash"))
+            head.append(label(f"updated {ago(snap.fetched_at if snap else 0)}", "hmtl-dim", "hmtl-small"))
+        btn = Gtk.Button(label="󰑐")
+        btn.add_css_class("hmtl-btn")
+        btn.set_tooltip_text("Refresh now")
+        btn.connect("clicked", lambda *_: signal_running(signal.SIGUSR2))
+        head.append(btn)
+        panel.append(head)
+
+        if not snap or not snap.accounts:
+            msg = (snap.error if snap else "") or "no data yet — is the waybar module running?"
+            panel.append(label(msg, "hmtl-err"))
+            return
+
+        accounts = snap.accounts
+        summary = provider_summary(accounts, cfg)
+        how = {"mean": "pooled average", "min": "worst account", "sum": "total"}.get(cfg["aggregate"], "")
+
+        panel.append(label(f"OVERALL · {how.upper()}", "hmtl-section"))
+        for provider, wins in summary.items():
+            icon = cfg["icons"].get(provider, cfg["icons"].get("default", ""))
+            n = sum(1 for a in accounts if a.provider == provider)
+            panel.append(label(f"{icon}  <b>{esc(provider.title())}</b>  <span foreground='{colors['dim']}'>{n} account{'s' if n != 1 else ''}</span>",
+                               "hmtl-name", markup=True))
+            g = new_grid()
+            known = [v for v in wins.values() if v is not None]
+            low = min(known) if known else None
+            for i, (win, val) in enumerate(wins.items()):
+                add_row(g, i, win, val, val == low, show_reset=False)
+            panel.append(g)
+
+        for provider, wins in summary.items():
+            rule = Gtk.Box()
+            rule.add_css_class("hmtl-rule")
+            panel.append(rule)
+            panel.append(label(provider.upper(), "hmtl-section"))
+            for a in [a for a in accounts if a.provider == provider]:
+                name_bits = f"<b>{esc(a.label)}</b>  <span foreground='{colors['dim']}' size='small'>{esc(a.email)}</span>"
+                if a.plan and a.plan.lower() not in ("oauth", "api_key"):
+                    name_bits += f"  <span foreground='{colors['dim']}' size='small'>· {esc(a.plan)}</span>"
+                if a.source == "cached":
+                    name_bits += f"  <span foreground='{colors['warning']}' size='small'>cached</span>"
+                panel.append(label(name_bits, "hmtl-name", markup=True))
+                if a.source == "none":
+                    panel.append(label(f"unavailable: {a.error}", "hmtl-err", "hmtl-small"))
+                    continue
+                g = new_grid()
+                eff = a.effective
+                for i, win in enumerate(wins):
+                    rem = a.remaining(win)
+                    w = a.windows.get(win)
+                    add_row(g, i, win, rem, rem == eff, w.resets_at if w else None)
+                panel.append(g)
+
+        if snap.error:
+            panel.append(label(f"last poll failed: {snap.error}", "hmtl-err", "hmtl-small"))
+        hint = label("s screenshot · p pin · r refresh · esc close", "hmtl-dim", "hmtl-small", xalign=1.0)
+        hint.set_margin_top(10)
+        panel.append(hint)
+
+    app = Gtk.Application(application_id=None)
+    state = {"mtime": 0.0, "was_active": False, "pinned": pin, "flash": "",
+             "flash_until": 0.0, "built_at": 0.0, "visible": False}
+    ui = {}
+
+    def rebuild():
+        build(ui["panel"])
+        state["built_at"] = time.time()
+
+    def place(win):
+        """Move the (unmapped) panel under the cursor on the clicked monitor."""
+        for edge in (LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT):
+            LayerShell.set_anchor(win, edge, False)
+        where = _hypr_cursor() if pc["anchor"] == "cursor" else None
+        monitor = None
+        if where:
+            mons = Gdk.Display.get_default().get_monitors()
+            for i in range(mons.get_n_items()):
+                m = mons.get_item(i)
+                if m.get_connector() == where[0]:
+                    monitor = m
+        width = pc["width"] + 16  # + panel side margins
+        if monitor:
+            LayerShell.set_monitor(win, monitor)
+            mw = monitor.get_geometry().width
+            left = int(min(max(where[1] - width / 2, pc["margin"]), mw - width - pc["margin"]))
+            LayerShell.set_anchor(win, LayerShell.Edge.LEFT, True)
+            LayerShell.set_margin(win, LayerShell.Edge.LEFT, left)
+        elif pc["anchor"] in ("left", "right", "cursor"):
+            # "cursor" without Hyprland falls back to the right edge
+            edge = LayerShell.Edge.LEFT if pc["anchor"] == "left" else LayerShell.Edge.RIGHT
+            LayerShell.set_anchor(win, edge, True)
+            LayerShell.set_margin(win, edge, pc["margin"])
+        # "center": anchored to TOP only, so the compositor centres it
+
+    def set_open(flag: bool):
+        try:
+            POPOVER_OPEN.touch() if flag else POPOVER_OPEN.unlink(missing_ok=True)
+        except OSError:
+            pass
+        signal_running(signal.SIGUSR1)  # bars pick up / drop the "open" class
+
+    def show(pinned=False):
+        win = ui["win"]
+        state["pinned"] = pinned
+        state["was_active"] = False
+        if time.time() - state["built_at"] > 15 or state["pinned"]:
+            rebuild()
+        place(win)
+        win.set_visible(True)
+        win.present()
+        state["visible"] = True
+        set_open(True)
+        # Opening the panel asks the bar for fresh numbers if they're old.
+        snap = load_cache()
+        if not snap or time.time() - snap.attempted_at > 60:
+            signal_running(signal.SIGUSR2)
+
+    def hide():
+        if not state["visible"]:
+            return
+        ui["win"].set_visible(False)
+        state["visible"] = False
+        state["pinned"] = False
+        set_open(False)
+
+    def toggle(pinned=False):
+        hide() if state["visible"] else show(pinned)
+        return True
+
+    def on_activate(app):
+        app.hold()  # stay resident while the window is hidden
+        provider = Gtk.CssProvider()
+        provider.load_from_string(css) if hasattr(provider, "load_from_string") else provider.load_from_data(css.encode())
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        win = Gtk.ApplicationWindow(application=app)
+        win.add_css_class("hmtl")
+        win.set_decorated(False)
+        win.set_resizable(False)
+        win.set_hide_on_close(True)
+
+        LayerShell.init_for_window(win)
+        LayerShell.set_namespace(win, APP)
+        LayerShell.set_layer(win, LayerShell.Layer.TOP)
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.ON_DEMAND)
+        LayerShell.set_exclusive_zone(win, 0)  # sit below the bar, don't push windows
+        LayerShell.set_anchor(win, LayerShell.Edge.TOP, True)
+
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        panel.add_css_class("hmtl-panel")
+        panel.set_size_request(pc["width"], -1)
+        win.set_child(panel)
+        ui["win"], ui["panel"] = win, panel
+        rebuild()
+
+        keys = Gtk.EventControllerKey()
+
+        def flash(msg, secs=4):
+            state["flash"], state["flash_until"] = msg, time.time() + secs
+            rebuild()
+            GLib.timeout_add(int(secs * 1000) + 50, lambda: (rebuild(), False)[1])
+
+        def shoot():
+            try:
+                path = capture_panel()
+                flash("󰄀 saved " + path.replace(str(Path.home()), "~") + " (copied)")
+            except Exception as e:  # noqa: BLE001 - show anything
+                flash(f"screenshot failed: {e}")
+            return False
+
+        def on_key(_c, kv, *_):
+            if kv == Gdk.KEY_Escape:
+                hide()
+            elif kv in (Gdk.KEY_s, Gdk.KEY_S):
+                GLib.timeout_add(120, shoot)  # let any key-repeat redraw settle
+            elif kv in (Gdk.KEY_p, Gdk.KEY_P):
+                state["pinned"] = not state["pinned"]
+                flash("󰐃 pinned — stays open for other tools" if state["pinned"] else "unpinned", 2)
+            elif kv in (Gdk.KEY_r, Gdk.KEY_R):
+                signal_running(signal.SIGUSR2)
+                flash("refreshing…", 2)
+            else:
+                return False
+            return True
+
+        keys.connect("key-pressed", on_key)
+        win.add_controller(keys)
+
+        def on_active(*_):
+            if not state["visible"]:
+                return
+            if win.is_active():
+                state["was_active"] = True
+            elif state["was_active"] and pc["close_on_focus_loss"] and not state["pinned"]:
+                hide()
+        win.connect("notify::is-active", on_active)
+
+        def tick():
+            # Keep the hidden panel current so showing it is just a map.
+            try:
+                mtime = CACHE_PATH.stat().st_mtime
+            except OSError:
+                mtime = 0
+            if mtime != state["mtime"] or (state["visible"] and time.time() - state["built_at"] > 30):
+                state["mtime"] = mtime
+                rebuild()
+            return True
+        GLib.timeout_add_seconds(2, tick)
+
+        win.realize()  # create the surface + renderer now, not on first click
+        if show_on_start:
+            show(pin)
+
+    app.connect("activate", on_activate)
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    POPOVER_PID.write_text(str(os.getpid()))
+    POPOVER_OPEN.unlink(missing_ok=True)
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        add_signal = GLibUnix.signal_add
+    except (ImportError, ValueError):
+        add_signal = GLib.unix_signal_add
+    add_signal(GLib.PRIORITY_HIGH, signal.SIGUSR1, lambda *_: toggle(False))
+    add_signal(GLib.PRIORITY_HIGH, signal.SIGUSR2, lambda *_: toggle(True))
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        add_signal(GLib.PRIORITY_DEFAULT, sig, lambda *_: (app.quit(), False)[1])
+    try:
+        app.run([])
+    finally:
+        try:
+            if POPOVER_PID.read_text().strip() == str(os.getpid()):
+                POPOVER_PID.unlink()
+        except OSError:
+            pass
+        POPOVER_OPEN.unlink(missing_ok=True)
+        signal_running(signal.SIGUSR1)
+    return 0
+
+
+def signal_running(sig: int) -> int:
+    pids = running_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+    if not pids:
+        print(f"{APP}: no running waybar module found", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_toggle() -> int:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    if EXPANDED_FLAG.exists():
+        EXPANDED_FLAG.unlink(missing_ok=True)
+    else:
+        EXPANDED_FLAG.touch()
+    return signal_running(signal.SIGUSR1)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog=APP, description=__doc__.split("\n\n")[0])
+    ap.add_argument("command", nargs="?", default="waybar",
+                    choices=["waybar", "once", "status", "toggle", "refresh", "popover", "screenshot", "dashboard"])
+    ap.add_argument("-c", "--config", type=Path, help=f"config file (default {CONFIG_PATH})")
+    ap.add_argument("--json", action="store_true", help="status: print JSON")
+    ap.add_argument("--pin", action="store_true", help="popover: don't close when focus moves away")
+    ap.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--show", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("-o", "--output", help="screenshot: file to write (default ~/Pictures/tokens-left-*.png)")
+    ap.add_argument("--version", action="version", version=f"{APP} {VERSION}")
+    args = ap.parse_args(argv)
+
+    if args.command == "toggle":
+        return cmd_toggle()
+    if args.command == "refresh":
+        return signal_running(signal.SIGUSR2)
+
+    try:
+        cfg = load_config(args.config)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        print(f"{APP}: bad config: {e}", file=sys.stderr)
+        return 2
+
+    if args.command == "popover":
+        return cmd_popover(cfg, pin=args.pin, daemon=args.daemon and not args.show)
+    if args.command == "screenshot":
+        try:
+            print(capture_panel(args.output))
+            return 0
+        except Exception as e:  # noqa: BLE001 - grim/hyprctl failures
+            print(f"{APP}: {e}", file=sys.stderr)
+            return 1
+    if args.command == "dashboard":
+        import subprocess
+        subprocess.Popen(["xdg-open", cfg["url"] + "/management.html#/quota"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 0
+    if args.command == "once":
+        return cmd_once(cfg)
+    if args.command == "status":
+        return cmd_status(cfg, args.json)
+    return cmd_waybar(cfg)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
